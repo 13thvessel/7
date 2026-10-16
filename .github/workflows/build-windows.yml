@@ -1,0 +1,950 @@
+name: Build Windows exe
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.1"
+      - name: Prepare project (scarica CloudStream e crea i file)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p work/src/desktopMain
+          git clone --depth 1 --branch v4.8.0 https://github.com/recloudstream/cloudstream.git cs \
+            || git clone --depth 1 --branch 4.8.0 https://github.com/recloudstream/cloudstream.git cs \
+            || git clone --depth 1 https://github.com/recloudstream/cloudstream.git cs
+          cp -r cs/library/src/commonMain work/src/commonMain
+          cp -r cs/library/src/jvmCommonMain work/src/jvmCommonMain
+          cp -r cs/library/src/jvmMain/kotlin work/src/desktopMain/
+          mkdir -p work/src/commonMain/kotlin/com/lagradost/api
+          mkdir -p work/src/desktopMain/kotlin/com/lagradost/desktop
+
+          cat > work/build.gradle.kts <<'CS_EOF_0'
+          import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+          plugins {
+              kotlin("multiplatform") version "2.3.20"
+              kotlin("plugin.serialization") version "2.3.20"
+              kotlin("plugin.compose") version "2.3.20"
+              id("org.jetbrains.compose") version "1.10.0"
+          }
+
+          group = "com.lagradost.desktop"
+          version = "4.8.0"
+
+          kotlin {
+              applyDefaultHierarchyTemplate()
+
+              jvm("desktop") {
+                  compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
+              }
+
+              compilerOptions {
+                  freeCompilerArgs.addAll(
+                      "-Xexpect-actual-classes",
+                      "-Xannotation-default-target=param-property"
+                  )
+              }
+
+              sourceSets {
+                  all {
+                      languageSettings {
+                          optIn("com.lagradost.cloudstream3.InternalAPI")
+                          optIn("com.lagradost.cloudstream3.Prerelease")
+                          optIn("com.lagradost.cloudstream3.UnsafeSSL")
+                      }
+                  }
+
+                  // ---- Stesse dipendenze del modulo `library` di CloudStream ----
+                  commonMain.dependencies {
+                      implementation("androidx.annotation:annotation:1.10.0")
+                      implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+                      implementation("org.jsoup:jsoup:1.22.1")
+                      implementation("org.jetbrains.kotlinx:atomicfu:0.33.0")
+                      implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+                      implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.8.0")
+                      implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+                      implementation("com.fleeksoft.ksoup:ksoup:0.2.6")
+                      implementation("io.ktor:ktor-http:3.5.0")
+                      implementation("com.github.Blatzar:NiceHttp:0.4.18")
+                      implementation("org.mozilla:rhino:1.8.1")
+                      implementation("com.uwetrottmann.tmdb2:tmdb-java:2.13.0")
+                      implementation("dev.whyoleg.cryptography:cryptography-core:0.6.0")
+                      implementation("dev.whyoleg.cryptography:cryptography-provider-optimal:0.6.0")
+                      implementation("me.xdrop:fuzzywuzzy:1.4.0")
+                  }
+
+                  val jvmCommonMain by creating {
+                      dependsOn(commonMain.get())
+                      dependencies {
+                          implementation("org.jetbrains.kotlin:kotlin-reflect:2.3.20")
+                          implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.3")
+                      }
+                  }
+
+                  // ---- Applicazione desktop ----
+                  val desktopMain by getting {
+                      dependsOn(jvmCommonMain)
+                      dependencies {
+                          implementation(compose.desktop.currentOs)
+                          implementation(compose.material3)
+                          implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")
+                          implementation("uk.co.caprica:vlcj:4.8.3") // player (richiede VLC 64 bit installato)
+                      }
+                  }
+              }
+          }
+
+          compose.desktop {
+              application {
+                  mainClass = "com.lagradost.desktop.MainKt"
+
+                  nativeDistributions {
+                      targetFormats(TargetFormat.Exe, TargetFormat.Msi)
+                      packageName = "CloudStream"
+                      packageVersion = "4.8.0"
+                      description = "CloudStream per Windows 11"
+                      vendor = "CloudStream Desktop"
+                      includeAllModules = true
+
+                      windows {
+                          menuGroup = "CloudStream"
+                          shortcut = true
+                          dirChooser = true
+                          perUserInstall = true
+                          upgradeUuid = "6f1c3b8e-2a4d-4f57-9c11-5b7d0a9e4c21"
+                      }
+                  }
+              }
+          }
+          CS_EOF_0
+          cat > work/settings.gradle.kts <<'CS_EOF_1'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io") // NiceHttp, NewPipeExtractor
+              }
+          }
+
+          rootProject.name = "CloudStreamDesktop"
+          CS_EOF_1
+          cat > work/gradle.properties <<'CS_EOF_2'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          CS_EOF_2
+          cat > work/src/commonMain/kotlin/com/lagradost/api/BuildConfig.kt <<'CS_EOF_3'
+          package com.lagradost.api
+
+          /** Sostituisce il BuildConfig generato da buildkonfig nel modulo originale. */
+          object BuildConfig {
+              val MDL_API_KEY: String = System.getenv("MDL_API_KEY") ?: ""
+              val TRAKT_CLIENT_ID: String = System.getenv("TRAKT_CLIENT_ID") ?: ""
+          }
+          CS_EOF_3
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/AppState.kt <<'CS_EOF_4'
+          package com.lagradost.desktop
+
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import com.lagradost.cloudstream3.APIHolder
+          import com.lagradost.cloudstream3.MainAPI
+          import com.lagradost.cloudstream3.SubtitleFile
+          import com.lagradost.cloudstream3.utils.ExtractorLink
+          import kotlinx.coroutines.withTimeoutOrNull
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          sealed interface Screen {
+              data object Home : Screen
+              data object Search : Screen
+              data object Favorites : Screen
+              data object Plugins : Screen
+              data class Details(val url: String, val apiName: String) : Screen
+              data class Play(val title: String, val link: ExtractorLink, val subs: List<SubtitleFile>) : Screen
+          }
+
+          class AppState {
+              private val stack = mutableStateListOf<Screen>(Screen.Home)
+              val current: Screen get() = stack.last()
+              val canGoBack: Boolean get() = stack.size > 1
+
+              fun push(s: Screen) { stack.add(s) }
+              fun pop() { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
+              fun root(s: Screen) { stack.clear(); stack.add(s) }
+
+              /** Provider scelto in Home (nome); null = primo disponibile. */
+              var selectedProvider by mutableStateOf<String?>(null)
+
+              /** Segnala il cambiamento della lista provider (dopo load/unload di un plugin). */
+              var providersVersion by mutableStateOf(0)
+
+              fun providers(): List<MainAPI> {
+                  providersVersion // legge lo stato per far ricomporre la UI
+                  return APIHolder.allProviders.withLock { APIHolder.allProviders.toList() }
+              }
+
+              fun message(text: String) { snackbar = text }
+              var snackbar by mutableStateOf<String?>(null)
+          }
+
+          /** Esegue loadLinks e raccoglie link + sottotitoli (timeout 25 s). */
+          suspend fun fetchLinks(api: MainAPI, data: String): Pair<List<ExtractorLink>, List<SubtitleFile>> {
+              val links = CopyOnWriteArrayList<ExtractorLink>()
+              val subs = CopyOnWriteArrayList<SubtitleFile>()
+              withTimeoutOrNull(25_000) {
+                  api.loadLinks(data, false, { subs.add(it) }, { links.add(it) })
+              }
+              return links.distinctBy { it.url }.sortedByDescending { it.quality } to subs.toList()
+          }
+          CS_EOF_4
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/Images.kt <<'CS_EOF_5'
+          package com.lagradost.desktop
+
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.produceState
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.toComposeImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.net.URI
+          import java.net.http.HttpClient
+          import java.net.http.HttpRequest
+          import java.net.http.HttpResponse
+
+          /** Caricamento immagini minimale con cache LRU in memoria (Skia decodifica anche WebP). */
+          object Images {
+              private val client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
+              private val cache = object : LinkedHashMap<String, ImageBitmap>(256, 0.75f, true) {
+                  override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>) = size > 300
+              }
+
+              suspend fun load(url: String, headers: Map<String, String>? = null): ImageBitmap? =
+                  synchronized(cache) { cache[url] } ?: withContext(Dispatchers.IO) {
+                      runCatching {
+                          val req = HttpRequest.newBuilder(URI.create(url)).apply {
+                              headers?.forEach { (k, v) -> runCatching { header(k, v) } }
+                          }.build()
+                          val bytes = client.send(req, HttpResponse.BodyHandlers.ofByteArray()).body()
+                          org.jetbrains.skia.Image.makeFromEncoded(bytes).toComposeImageBitmap()
+                              .also { synchronized(cache) { cache[url] = it } }
+                      }.getOrNull()
+                  }
+          }
+
+          @Composable
+          fun Poster(
+              url: String?,
+              modifier: Modifier = Modifier,
+              headers: Map<String, String>? = null,
+              contentScale: ContentScale = ContentScale.Crop,
+          ) {
+              val bmp by produceState<ImageBitmap?>(null, url) { value = url?.let { Images.load(it, headers) } }
+              Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant)) {
+                  bmp?.let { Image(it, null, Modifier.matchParentSize(), contentScale = contentScale) }
+              }
+          }
+          CS_EOF_5
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/Main.kt <<'CS_EOF_6'
+          package com.lagradost.desktop
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.DpSize
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.window.Window
+          import androidx.compose.ui.window.application
+          import androidx.compose.ui.window.rememberWindowState
+
+          fun main() {
+              Storage.load()
+              val pluginErrors = PluginManager.loadAll()
+
+              application {
+                  val state = remember { AppState().also { s -> if (pluginErrors.isNotEmpty()) s.snackbar = pluginErrors.first() } }
+                  Window(
+                      onCloseRequest = ::exitApplication,
+                      title = "CloudStream Desktop",
+                      state = rememberWindowState(size = DpSize(1280.dp, 820.dp)),
+                  ) {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(Modifier.fillMaxSize()) { App(state) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun App(state: AppState) {
+              val host = remember { SnackbarHostState() }
+              LaunchedEffect(state.snackbar) {
+                  state.snackbar?.let { host.showSnackbar(it); state.snackbar = null }
+              }
+
+              Scaffold(snackbarHost = { SnackbarHost(host) }) { pad ->
+                  Row(Modifier.padding(pad).fillMaxSize()) {
+                      if (state.current !is Screen.Play) {
+                          NavigationRail {
+                              Spacer(Modifier.height(8.dp))
+                              @Composable
+                              fun item(label: String, icon: String, target: Screen) = NavigationRailItem(
+                                  selected = state.current == target,
+                                  onClick = { state.root(target) },
+                                  icon = { Text(icon) }, label = { Text(label) },
+                              )
+                              item("Home", "🏠", Screen.Home)
+                              item("Cerca", "🔍", Screen.Search)
+                              item("Preferiti", "★", Screen.Favorites)
+                              item("Estensioni", "🧩", Screen.Plugins)
+                          }
+                      }
+                      Box(Modifier.weight(1f).fillMaxHeight()) {
+                          when (val s = state.current) {
+                              Screen.Home -> HomeScreen(state)
+                              Screen.Search -> SearchScreen(state)
+                              Screen.Favorites -> FavoritesScreen(state)
+                              Screen.Plugins -> PluginsScreen(state)
+                              is Screen.Details -> DetailsScreen(state, s.url, s.apiName)
+                              is Screen.Play -> PlayerScreen(s.title, s.link, s.subs) { state.pop() }
+                          }
+                      }
+                  }
+              }
+          }
+          CS_EOF_6
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/Player.kt <<'CS_EOF_7'
+          package com.lagradost.desktop
+
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.awt.SwingPanel
+          import androidx.compose.ui.unit.dp
+          import com.lagradost.cloudstream3.SubtitleFile
+          import com.lagradost.cloudstream3.utils.ExtractorLink
+          import kotlinx.coroutines.delay
+          import uk.co.caprica.vlcj.player.component.EmbeddedMediaPlayerComponent
+          import java.awt.Desktop
+          import java.net.URI
+
+          /** Player integrato basato su libVLC (vlcj). Richiede VLC 64 bit installato. */
+          @Composable
+          fun PlayerScreen(title: String, link: ExtractorLink, subs: List<SubtitleFile>, onBack: () -> Unit) {
+              val component = remember { runCatching { EmbeddedMediaPlayerComponent() } }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      TextButton(onClick = onBack) { Text("← Indietro") }
+                      Text("$title — ${link.name}", style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                  }
+
+                  val c = component.getOrNull()
+                  if (c == null) {
+                      Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          Text("Impossibile avviare libVLC. Installa VLC media player a 64 bit (videolan.org) e riprova.")
+                          Text(link.url, style = MaterialTheme.typography.bodySmall)
+                          Button(onClick = { runCatching { Desktop.getDesktop().browse(URI(link.url)) } }) {
+                              Text("Apri link nel browser")
+                          }
+                      }
+                      return@Column
+                  }
+
+                  val mp = c.mediaPlayer()
+                  var paused by remember { mutableStateOf(false) }
+                  var position by remember { mutableStateOf(0f) }
+                  var volume by remember { mutableStateOf(100f) }
+                  var subIndex by remember { mutableStateOf(-1) }
+
+                  DisposableEffect(link.url) {
+                      val opts = buildList {
+                          if (link.referer.isNotBlank()) add(":http-referrer=${link.referer}")
+                          (link.headers["User-Agent"] ?: link.headers["user-agent"])?.let { add(":http-user-agent=$it") }
+                      }
+                      mp.media().play(link.url, *opts.toTypedArray())
+                      onDispose {
+                          mp.controls().stop()
+                          c.release()
+                      }
+                  }
+                  LaunchedEffect(Unit) {
+                      while (true) { position = mp.status().position(); delay(500) }
+                  }
+
+                  SwingPanel(factory = { c }, modifier = Modifier.weight(1f).fillMaxWidth())
+
+                  Row(
+                      Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.spacedBy(12.dp),
+                  ) {
+                      Button(onClick = { mp.controls().pause(); paused = !paused }) { Text(if (paused) "▶" else "⏸") }
+                      Slider(
+                          value = position.coerceIn(0f, 1f),
+                          onValueChange = { position = it; mp.controls().setPosition(it) },
+                          modifier = Modifier.weight(1f),
+                      )
+                      Text("🔊")
+                      Slider(
+                          value = volume, valueRange = 0f..120f,
+                          onValueChange = { volume = it; mp.audio().setVolume(it.toInt()) },
+                          modifier = Modifier.width(120.dp),
+                      )
+                      if (subs.isNotEmpty()) {
+                          var open by remember { mutableStateOf(false) }
+                          Box {
+                              OutlinedButton(onClick = { open = true }) { Text("Sottotitoli") }
+                              DropdownMenu(open, { open = false }) {
+                                  DropdownMenuItem(text = { Text("Nessuno") }, onClick = {
+                                      mp.subpictures().setTrack(-1); subIndex = -1; open = false
+                                  })
+                                  subs.forEachIndexed { i, s ->
+                                      DropdownMenuItem(text = { Text(s.lang) }, onClick = {
+                                          mp.subpictures().setSubTitleUri(s.url); subIndex = i; open = false
+                                      })
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          CS_EOF_7
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/PluginManager.kt <<'CS_EOF_8'
+          package com.lagradost.desktop
+
+          import androidx.compose.runtime.mutableStateListOf
+          import com.lagradost.cloudstream3.APIHolder
+          import com.lagradost.cloudstream3.mapper
+          import com.lagradost.cloudstream3.plugins.BasePlugin
+          import java.io.File
+          import java.net.URI
+          import java.net.URLClassLoader
+          import java.net.http.HttpClient
+          import java.net.http.HttpRequest
+          import java.net.http.HttpResponse
+          import java.util.jar.JarFile
+
+          /**
+           * Le estensioni Android (.cs3) sono DEX e NON girano su desktop.
+           * Su desktop un plugin è un normale .jar che contiene alla radice un `manifest.json`
+           * ({"name": "...", "pluginClassName": "com.esempio.MioPlugin", "version": 1})
+           * e una classe che estende [BasePlugin] e chiama registerMainAPI(...) in load().
+           */
+          object PluginManager {
+              class Loaded(
+                  val file: File,
+                  val name: String,
+                  val version: Int?,
+                  val loader: URLClassLoader,
+                  val instance: BasePlugin,
+              )
+
+              val loaded = mutableStateListOf<Loaded>()
+
+              /** Carica tutti i .jar della cartella plugin. Ritorna la lista degli errori. */
+              fun loadAll(): List<String> =
+                  (Storage.pluginsDir.listFiles { f -> f.extension.equals("jar", true) } ?: emptyArray())
+                      .mapNotNull { f -> load(f).exceptionOrNull()?.let { "${f.name}: ${it.message ?: it}" } }
+
+              fun load(file: File): Result<Loaded> = runCatching {
+                  if (loaded.any { it.file.absolutePath == file.absolutePath }) error("Già caricato")
+
+                  val manifest = JarFile(file).use { jar ->
+                      val entry = jar.getJarEntry("manifest.json") ?: error("manifest.json mancante nel jar")
+                      jar.getInputStream(entry).use { mapper.readValue(it, BasePlugin.Manifest::class.java) }
+                  }
+                  val className = manifest.pluginClassName ?: error("pluginClassName mancante")
+
+                  val loader = URLClassLoader(arrayOf(file.toURI().toURL()), PluginManager::class.java.classLoader)
+                  val plugin = loader.loadClass(className).getDeclaredConstructor().newInstance() as BasePlugin
+                  plugin.filename = file.absolutePath
+                  plugin.load()
+                  APIHolder.initAll()
+
+                  Loaded(file, manifest.name ?: file.nameWithoutExtension, manifest.version, loader, plugin)
+                      .also { loaded.add(it) }
+              }
+
+              fun unload(p: Loaded) {
+                  runCatching { p.instance.beforeUnload() }
+                  val mine = APIHolder.allProviders.filter { it.sourcePlugin == p.file.absolutePath }
+                  mine.forEach {
+                      APIHolder.allProviders.remove(it)
+                      APIHolder.removePluginMapping(it)
+                  }
+                  runCatching { p.loader.close() }
+                  loaded.remove(p)
+              }
+
+              /** Scarica un .jar da URL nella cartella plugin e lo carica. */
+              fun installFromUrl(url: String): Result<Loaded> = runCatching {
+                  val name = url.substringAfterLast('/').substringBefore('?').ifBlank { "plugin.jar" }
+                      .let { if (it.endsWith(".jar", true)) it else "$it.jar" }
+                  val target = File(Storage.pluginsDir, name)
+                  val resp = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
+                      .send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofByteArray())
+                  if (resp.statusCode() !in 200..299) error("HTTP ${resp.statusCode()}")
+                  target.writeBytes(resp.body())
+                  load(target).getOrThrow()
+              }
+
+              fun installFromFile(src: File): Result<Loaded> = runCatching {
+                  val target = File(Storage.pluginsDir, src.name)
+                  src.copyTo(target, overwrite = true)
+                  load(target).getOrThrow()
+              }
+          }
+          CS_EOF_8
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/Screens.kt <<'CS_EOF_9'
+          package com.lagradost.desktop
+
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import com.lagradost.cloudstream3.*
+          import com.lagradost.cloudstream3.utils.ExtractorLink
+          import kotlinx.coroutines.*
+          import java.awt.FileDialog
+          import java.awt.Frame
+          import java.awt.Desktop
+
+          // ───────────────────────── componenti comuni ─────────────────────────
+
+          @Composable
+          fun PosterCard(
+              name: String, posterUrl: String?, headers: Map<String, String>?, subtitle: String? = null,
+              modifier: Modifier = Modifier, onClick: () -> Unit,
+          ) {
+              Column(modifier.width(150.dp).clip(RoundedCornerShape(10.dp)).clickable(onClick = onClick).padding(4.dp)) {
+                  Poster(posterUrl, Modifier.fillMaxWidth().aspectRatio(2f / 3f).clip(RoundedCornerShape(8.dp)), headers)
+                  Spacer(Modifier.height(6.dp))
+                  Text(name, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                  subtitle?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+              }
+          }
+
+          @Composable
+          fun SearchResponse.toCard(onClick: () -> Unit) =
+              PosterCard(name, posterUrl, posterHeaders, apiName, onClick = onClick)
+
+          @Composable
+          fun Centered(content: @Composable ColumnScope.() -> Unit) =
+              Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally, content = content)
+
+          @Composable
+          fun NoProviders(state: AppState) = Centered {
+              Text("Nessuna estensione installata", style = MaterialTheme.typography.titleLarge)
+              Spacer(Modifier.height(8.dp))
+              Text("Come nell'app originale, senza estensioni non ci sono fonti video.")
+              Spacer(Modifier.height(16.dp))
+              Button(onClick = { state.root(Screen.Plugins) }) { Text("Gestisci estensioni") }
+          }
+
+          // ───────────────────────── Home ─────────────────────────
+
+          @Composable
+          fun HomeScreen(state: AppState) {
+              val providers = state.providers()
+              if (providers.isEmpty()) return NoProviders(state)
+
+              val api = providers.firstOrNull { it.name == state.selectedProvider } ?: providers.first()
+              var rows by remember(api) { mutableStateOf<List<HomePageList>>(emptyList()) }
+              var loading by remember(api) { mutableStateOf(true) }
+              var error by remember(api) { mutableStateOf<String?>(null) }
+
+              LaunchedEffect(api) {
+                  loading = true; error = null; rows = emptyList()
+                  if (!api.hasMainPage) { loading = false; return@LaunchedEffect }
+                  // carica le sezioni in parallelo, mostrandole man mano
+                  coroutineScope {
+                      api.mainPage.map { page ->
+                          async {
+                              runCatching {
+                                  api.getMainPage(1, MainPageRequest(page.name, page.data, page.horizontalImages))
+                              }.onSuccess { r -> if (r != null) rows = rows + r.items }
+                                  .onFailure { error = it.message ?: it.toString() }
+                          }
+                      }.awaitAll()
+                  }
+                  loading = false
+              }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Text("Home", style = MaterialTheme.typography.headlineSmall)
+                      var open by remember { mutableStateOf(false) }
+                      Box {
+                          OutlinedButton(onClick = { open = true }) { Text("${api.name} ▾") }
+                          DropdownMenu(open, { open = false }) {
+                              providers.forEach { p ->
+                                  DropdownMenuItem(text = { Text(p.name) }, onClick = { state.selectedProvider = p.name; open = false })
+                              }
+                          }
+                      }
+                      if (loading) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                  }
+                  error?.let { Text("Errore: $it", color = MaterialTheme.colorScheme.error) }
+                  if (!api.hasMainPage) Text("Questa estensione non ha una home: usa la ricerca.")
+
+                  LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                      items(rows) { row ->
+                          Text(row.name, style = MaterialTheme.typography.titleMedium)
+                          Spacer(Modifier.height(6.dp))
+                          LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              items(row.list) { r -> r.toCard { state.push(Screen.Details(r.url, r.apiName)) } }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ───────────────────────── Cerca ─────────────────────────
+
+          @Composable
+          fun SearchScreen(state: AppState) {
+              val providers = state.providers()
+              if (providers.isEmpty()) return NoProviders(state)
+
+              var query by remember { mutableStateOf("") }
+              var results by remember { mutableStateOf<List<SearchResponse>>(emptyList()) }
+              var loading by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+              var job by remember { mutableStateOf<Job?>(null) }
+
+              fun doSearch() {
+                  val q = query.trim()
+                  if (q.isEmpty()) return
+                  job?.cancel()
+                  results = emptyList(); loading = true
+                  job = scope.launch {
+                      coroutineScope {
+                          providers.map { api ->
+                              async {
+                                  runCatching { withTimeout(20_000) { api.search(q) } }.getOrNull()
+                                      ?.let { r -> results = results + r }
+                              }
+                          }.awaitAll()
+                      }
+                      loading = false
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                      OutlinedTextField(
+                          value = query, onValueChange = { query = it }, singleLine = true,
+                          label = { Text("Cerca film, serie, anime…") },
+                          keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                          keyboardActions = KeyboardActions(onSearch = { doSearch() }),
+                          modifier = Modifier.weight(1f),
+                      )
+                      Button(onClick = ::doSearch) { Text("Cerca") }
+                      if (loading) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  LazyVerticalGrid(GridCells.Adaptive(160.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(results) { r -> r.toCard { state.push(Screen.Details(r.url, r.apiName)) } }
+                  }
+              }
+          }
+
+          // ───────────────────────── Dettagli ─────────────────────────
+
+          private data class EpisodeItem(val label: String, val data: String, val description: String?)
+
+          private fun Episode.toItem(i: Int) = EpisodeItem(
+              label = buildString {
+                  if (season != null) append("S$season")
+                  append("E${episode ?: (i + 1)}")
+                  name?.let { append(" · $it") }
+              },
+              data = data, description = description,
+          )
+
+          @Composable
+          fun DetailsScreen(state: AppState, url: String, apiName: String) {
+              val api = remember(apiName) { APIHolder.getApiFromNameNull(apiName) }
+              var load by remember(url) { mutableStateOf<LoadResponse?>(null) }
+              var error by remember(url) { mutableStateOf<String?>(null) }
+              var dub by remember(url) { mutableStateOf<DubStatus?>(null) }
+              val scope = rememberCoroutineScope()
+
+              var linksDialog by remember { mutableStateOf<Pair<List<ExtractorLink>, List<SubtitleFile>>?>(null) }
+              var resolving by remember { mutableStateOf(false) }
+              var playTitle by remember { mutableStateOf("") }
+
+              LaunchedEffect(url) {
+                  if (api == null) { error = "Estensione \"$apiName\" non caricata"; return@LaunchedEffect }
+                  runCatching { api.load(url) }
+                      .onSuccess { load = it; if (it == null) error = "Nessun risultato" }
+                      .onFailure { error = it.message ?: it.toString() }
+              }
+
+              fun play(title: String, data: String) {
+                  val a = api ?: return
+                  resolving = true; playTitle = title
+                  scope.launch {
+                      val r = runCatching { fetchLinks(a, data) }.getOrNull()
+                      resolving = false
+                      if (r == null || r.first.isEmpty()) state.message("Nessun link trovato") else linksDialog = r
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  TextButton(onClick = { state.pop() }) { Text("← Indietro") }
+                  error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                  val d = load
+                  if (d == null && error == null) CircularProgressIndicator()
+                  if (d != null) {
+                      Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                          Poster(d.posterUrl, Modifier.width(220.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(10.dp)), d.posterHeaders)
+                          Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Text(d.name, style = MaterialTheme.typography.headlineMedium)
+                              Text(
+                                  listOfNotNull(d.year?.toString(), d.score?.toDouble(10)?.let { "★ %.1f".format(it) },
+                                      d.duration?.let { "$it min" }, d.apiName).joinToString(" · "),
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                              d.tags?.takeIf { it.isNotEmpty() }?.let { Text(it.joinToString(", "), style = MaterialTheme.typography.labelLarge) }
+                              d.plot?.let { Text(it, maxLines = 8, overflow = TextOverflow.Ellipsis) }
+                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  if (d is MovieLoadResponse) Button(onClick = { play(d.name, d.dataUrl) }) { Text("▶ Riproduci") }
+                                  if (d is LiveStreamLoadResponse) Button(onClick = { play(d.name, d.dataUrl) }) { Text("▶ Riproduci") }
+                                  val fav = Storage.Fav(d.name, d.url, d.apiName, d.posterUrl)
+                                  val isFav = Storage.isFavorite(d.url, d.apiName)
+                                  OutlinedButton(onClick = { Storage.toggleFavorite(fav) }) { Text(if (isFav) "★ Nei preferiti" else "☆ Aggiungi ai preferiti") }
+                                  if (resolving) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(12.dp))
+
+                      val episodes: List<EpisodeItem> = when (d) {
+                          is TvSeriesLoadResponse -> d.episodes.mapIndexed { i, e -> e.toItem(i) }
+                          is AnimeLoadResponse -> {
+                              val keys = d.episodes.keys.toList()
+                              val sel = dub?.takeIf { it in keys } ?: keys.firstOrNull()
+                              if (keys.size > 1) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  keys.forEach { k ->
+                                      FilterChip(selected = k == sel, onClick = { dub = k }, label = { Text(k.name) })
+                                  }
+                              }
+                              d.episodes[sel].orEmpty().mapIndexed { i, e -> e.toItem(i) }
+                          }
+                          else -> emptyList()
+                      }
+                      if (episodes.isNotEmpty()) {
+                          Text("Episodi (${episodes.size})", style = MaterialTheme.typography.titleMedium)
+                          LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                              items(episodes) { ep ->
+                                  ListItem(
+                                      headlineContent = { Text(ep.label) },
+                                      supportingContent = ep.description?.let { { Text(it, maxLines = 2, overflow = TextOverflow.Ellipsis) } },
+                                      trailingContent = { TextButton(onClick = { play("${d.name} – ${ep.label}", ep.data) }) { Text("▶") } },
+                                      modifier = Modifier.clickable { play("${d.name} – ${ep.label}", ep.data) },
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+
+              linksDialog?.let { (links, subs) ->
+                  AlertDialog(
+                      onDismissRequest = { linksDialog = null },
+                      title = { Text("Scegli la sorgente") },
+                      text = {
+                          LazyColumn {
+                              items(links) { l ->
+                                  ListItem(
+                                      headlineContent = { Text(l.name) },
+                                      supportingContent = { Text(if (l.quality > 0) "${l.quality}p · ${l.type}" else l.type.toString()) },
+                                      modifier = Modifier.clickable {
+                                          linksDialog = null
+                                          state.push(Screen.Play(playTitle, l, subs))
+                                      },
+                                  )
+                              }
+                          }
+                      },
+                      confirmButton = { TextButton(onClick = { linksDialog = null }) { Text("Annulla") } },
+                  )
+              }
+          }
+
+          // ───────────────────────── Preferiti ─────────────────────────
+
+          @Composable
+          fun FavoritesScreen(state: AppState) {
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("Preferiti", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(Modifier.height(8.dp))
+                  if (Storage.favorites.isEmpty()) Text("Ancora nessun preferito.")
+                  LazyVerticalGrid(GridCells.Adaptive(160.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(Storage.favorites.toList()) { f ->
+                          PosterCard(f.name, f.posterUrl, null, f.apiName) { state.push(Screen.Details(f.url, f.apiName)) }
+                      }
+                  }
+              }
+          }
+
+          // ───────────────────────── Estensioni ─────────────────────────
+
+          @Composable
+          fun PluginsScreen(state: AppState) {
+              var url by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+
+              fun report(r: Result<PluginManager.Loaded>) {
+                  state.providersVersion++
+                  state.message(r.fold({ "Caricata: ${it.name}" }, { "Errore: ${it.message ?: it}" }))
+              }
+
+              Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  Text("Estensioni", style = MaterialTheme.typography.headlineSmall)
+                  Text(
+                      "Le estensioni Android (.cs3) non sono compatibili con Windows. Servono plugin .jar " +
+                          "compilati per JVM contro la libreria di CloudStream (vedi README).",
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      OutlinedTextField(url, { url = it }, singleLine = true, label = { Text("URL di un plugin .jar") }, modifier = Modifier.weight(1f))
+                      Button(enabled = url.isNotBlank() && !busy, onClick = {
+                          busy = true
+                          scope.launch { report(withContext(Dispatchers.IO) { PluginManager.installFromUrl(url.trim()) }); busy = false; url = "" }
+                      }) { Text("Installa") }
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedButton(onClick = {
+                          val dlg = FileDialog(null as Frame?, "Seleziona un plugin .jar", FileDialog.LOAD)
+                          dlg.setFilenameFilter { _, n -> n.endsWith(".jar", true) }
+                          dlg.isVisible = true
+                          val f = dlg.file?.let { java.io.File(dlg.directory, it) }
+                          if (f != null) report(PluginManager.installFromFile(f))
+                      }) { Text("Da file…") }
+                      OutlinedButton(onClick = { runCatching { Desktop.getDesktop().open(Storage.pluginsDir) } }) { Text("Apri cartella plugin") }
+                  }
+                  HorizontalDivider()
+                  if (PluginManager.loaded.isEmpty()) Text("Nessun plugin caricato.")
+                  LazyColumn {
+                      items(PluginManager.loaded.toList()) { p ->
+                          ListItem(
+                              headlineContent = { Text(p.name) },
+                              supportingContent = { Text(p.file.name + (p.version?.let { " · v$it" } ?: "")) },
+                              trailingContent = {
+                                  TextButton(onClick = { PluginManager.unload(p); state.providersVersion++ }) { Text("Rimuovi") }
+                              },
+                          )
+                      }
+                  }
+              }
+          }
+          CS_EOF_9
+          cat > work/src/desktopMain/kotlin/com/lagradost/desktop/Storage.kt <<'CS_EOF_10'
+          package com.lagradost.desktop
+
+          import androidx.compose.runtime.mutableStateListOf
+          import com.lagradost.cloudstream3.mapper
+          import java.io.File
+
+          /** Cartelle e dati persistenti in %APPDATA%\CloudStreamDesktop */
+          object Storage {
+              val root: File = File(System.getenv("APPDATA") ?: System.getProperty("user.home"), "CloudStreamDesktop")
+                  .also { it.mkdirs() }
+              val pluginsDir: File = File(root, "plugins").also { it.mkdirs() }
+              private val favFile = File(root, "favorites.json")
+
+              data class Fav(
+                  val name: String = "",
+                  val url: String = "",
+                  val apiName: String = "",
+                  val posterUrl: String? = null,
+              )
+
+              val favorites = mutableStateListOf<Fav>()
+
+              fun load() {
+                  runCatching {
+                      if (favFile.exists()) {
+                          favorites.clear()
+                          favorites.addAll(mapper.readValue(favFile, Array<Fav>::class.java).toList())
+                      }
+                  }
+              }
+
+              private fun save() {
+                  runCatching { favFile.writeText(mapper.writeValueAsString(favorites.toList())) }
+              }
+
+              fun isFavorite(url: String, apiName: String) = favorites.any { it.url == url && it.apiName == apiName }
+
+              fun toggleFavorite(fav: Fav) {
+                  val existing = favorites.firstOrNull { it.url == fav.url && it.apiName == fav.apiName }
+                  if (existing != null) favorites.remove(existing) else favorites.add(fav)
+                  save()
+              }
+          }
+          CS_EOF_10
+      - name: Build app (cartella con CloudStream.exe)
+        working-directory: work
+        shell: bash
+        run: gradle createDistributable --no-daemon --stacktrace
+      - name: Build installer (opzionale)
+        working-directory: work
+        continue-on-error: true
+        shell: bash
+        run: gradle packageExe --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CloudStream-Windows
+          path: |
+            work/build/compose/binaries/main/app/CloudStream/**
+            work/build/compose/binaries/main/exe/*.exe
